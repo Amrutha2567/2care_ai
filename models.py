@@ -1,161 +1,208 @@
 """
-main.py — FastAPI application entry point.
-
-Sets up:
-- Database connection pool
-- Redis connection
-- Dependency injection for memory, scheduling, agent
-- All routers (voice, campaigns, metrics, health)
-- Structured logging
-- Prometheus metrics
+Database models for VoiceRx appointment booking system.
 """
 from __future__ import annotations
 
-import os
-from contextlib import asynccontextmanager
+import enum
+import uuid
+from datetime import datetime
+from typing import Optional
 
-import anthropic
-import redis.asyncio as aioredis
-import structlog
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from prometheus_client import make_asgi_app
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-
-from agent.agent_core import VoiceAgent
-from memory.memory_manager import MemoryManager
-from scheduling.scheduling_service import SchedulingService
-from .voice_gateway import router as voice_router
-from .campaigns_router import router as campaigns_router
-from .metrics_router import router as metrics_router
-
-# Configure structured logging
-structlog.configure(
-    processors=[
-        structlog.contextvars.merge_contextvars,
-        structlog.processors.add_log_level,
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.dev.ConsoleRenderer() if os.getenv("APP_ENV") == "development"
-        else structlog.processors.JSONRenderer(),
-    ],
+from sqlalchemy import (
+    Boolean, Column, DateTime, Enum, ForeignKey,
+    Integer, String, Text, UniqueConstraint, Index, Float, JSON
 )
-
-log = structlog.get_logger()
-
-# ── Global singletons ──────────────────────────────────────────────────────
-
-_engine = None
-_session_factory = None
-_redis_client = None
-_memory_manager = None
-_scheduling_service = None
-_anthropic_client = None
-_agent = None
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import DeclarativeBase, relationship
+from sqlalchemy.sql import func
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Initialise all resources at startup, clean up at shutdown."""
-    global _engine, _session_factory, _redis_client
-    global _memory_manager, _scheduling_service, _anthropic_client, _agent
+class Base(DeclarativeBase):
+    pass
 
-    log.info("voicerx.starting")
 
-    # Database
-    _engine = create_async_engine(
-        os.getenv("DATABASE_URL", "postgresql+asyncpg://voicerx:voicerx@localhost:5432/voicerx"),
-        pool_size=int(os.getenv("DATABASE_POOL_SIZE", 20)),
-        max_overflow=int(os.getenv("DATABASE_MAX_OVERFLOW", 40)),
-        echo=os.getenv("APP_ENV") == "development",
+class Language(str, enum.Enum):
+    EN = "en"
+    HI = "hi"
+    TA = "ta"
+
+
+class AppointmentStatus(str, enum.Enum):
+    SCHEDULED = "scheduled"
+    CONFIRMED = "confirmed"
+    CANCELLED = "cancelled"
+    COMPLETED = "completed"
+    NO_SHOW = "no_show"
+
+
+class CampaignStatus(str, enum.Enum):
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class CampaignOutcome(str, enum.Enum):
+    CONFIRMED = "confirmed"
+    RESCHEDULED = "rescheduled"
+    CANCELLED = "cancelled"
+    NO_ANSWER = "no_answer"
+    REJECTED = "rejected"
+    VOICEMAIL = "voicemail"
+
+
+# ── Doctors ────────────────────────────────────────────────────────────────
+
+class Doctor(Base):
+    __tablename__ = "doctors"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String(200), nullable=False)
+    specialty = Column(String(100), nullable=False)
+    qualification = Column(String(200))
+    languages_spoken = Column(JSON, default=list)  # ["en", "hi", "ta"]
+    consultation_duration_minutes = Column(Integer, default=30)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    slots = relationship("AvailabilitySlot", back_populates="doctor", cascade="all, delete-orphan")
+    appointments = relationship("Appointment", back_populates="doctor")
+
+    def __repr__(self):
+        return f"<Doctor {self.name} ({self.specialty})>"
+
+
+# ── Availability ───────────────────────────────────────────────────────────
+
+class AvailabilitySlot(Base):
+    __tablename__ = "availability_slots"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    doctor_id = Column(UUID(as_uuid=True), ForeignKey("doctors.id", ondelete="CASCADE"), nullable=False)
+    start_time = Column(DateTime(timezone=True), nullable=False)
+    end_time = Column(DateTime(timezone=True), nullable=False)
+    is_booked = Column(Boolean, default=False)
+    is_blocked = Column(Boolean, default=False)  # doctor unavailable (holiday etc.)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    doctor = relationship("Doctor", back_populates="slots")
+    appointment = relationship("Appointment", back_populates="slot", uselist=False)
+
+    __table_args__ = (
+        UniqueConstraint("doctor_id", "start_time", name="uq_doctor_slot"),
+        Index("ix_slots_doctor_start", "doctor_id", "start_time"),
+        Index("ix_slots_available", "doctor_id", "is_booked", "is_blocked", "start_time"),
     )
-    _session_factory = async_sessionmaker(_engine, expire_on_commit=False, class_=AsyncSession)
 
-    # Redis
-    _redis_client = aioredis.from_url(
-        os.getenv("REDIS_URL", "redis://localhost:6379/0"),
-        encoding="utf-8",
-        decode_responses=True,
-    )
-    await _redis_client.ping()
 
-    # Services
-    _memory_manager = MemoryManager(
-        redis_client=_redis_client,
-        session_ttl=int(os.getenv("REDIS_SESSION_TTL", 7200)),
-        patient_cache_ttl=int(os.getenv("REDIS_PATIENT_CACHE_TTL", 300)),
-        availability_cache_ttl=int(os.getenv("REDIS_AVAILABILITY_CACHE_TTL", 60)),
-    )
+# ── Patients ───────────────────────────────────────────────────────────────
 
-    _scheduling_service = SchedulingService(memory=_memory_manager)
+class Patient(Base):
+    __tablename__ = "patients"
 
-    _anthropic_client = anthropic.AsyncAnthropic(
-        api_key=os.getenv("ANTHROPIC_API_KEY")
-    )
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String(200), nullable=False)
+    phone_number = Column(String(20), unique=True, nullable=False)
+    preferred_language = Column(Enum(Language), default=Language.EN)
+    preferred_doctor_id = Column(UUID(as_uuid=True), ForeignKey("doctors.id"), nullable=True)
+    date_of_birth = Column(DateTime, nullable=True)
+    email = Column(String(200), nullable=True)
+    notes = Column(Text, nullable=True)  # clinical notes, chronic conditions (non-sensitive)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
-    _agent = VoiceAgent(
-        anthropic_client=_anthropic_client,
-        scheduling_service=_scheduling_service,
-        memory_manager=_memory_manager,
-        db_session_factory=_session_factory,
-        model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514"),
+    appointments = relationship("Appointment", back_populates="patient")
+    sessions = relationship("SessionSummary", back_populates="patient")
+    preferred_doctor = relationship("Doctor", foreign_keys=[preferred_doctor_id])
+
+    __table_args__ = (
+        Index("ix_patients_phone", "phone_number"),
     )
 
-    log.info("voicerx.ready")
-    yield
 
-    # Shutdown
-    log.info("voicerx.shutting_down")
-    await _redis_client.aclose()
-    await _engine.dispose()
-    log.info("voicerx.stopped")
+# ── Appointments ───────────────────────────────────────────────────────────
 
+class Appointment(Base):
+    __tablename__ = "appointments"
 
-# ── App ────────────────────────────────────────────────────────────────────
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    patient_id = Column(UUID(as_uuid=True), ForeignKey("patients.id", ondelete="CASCADE"), nullable=False)
+    doctor_id = Column(UUID(as_uuid=True), ForeignKey("doctors.id"), nullable=False)
+    slot_id = Column(UUID(as_uuid=True), ForeignKey("availability_slots.id"), nullable=False, unique=True)
+    status = Column(Enum(AppointmentStatus), default=AppointmentStatus.SCHEDULED)
+    reason = Column(Text, nullable=True)
+    confirmation_code = Column(String(8), unique=True)
+    booked_via = Column(String(50), default="voice_agent")  # voice_agent | web | campaign
+    session_id = Column(String(200), nullable=True)  # call_sid that created this
+    cancelled_at = Column(DateTime(timezone=True), nullable=True)
+    cancellation_reason = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
-app = FastAPI(
-    title="VoiceRx",
-    description="Real-Time Multilingual Voice AI Agent for Clinical Appointment Booking",
-    version="1.0.0",
-    lifespan=lifespan,
-)
+    patient = relationship("Patient", back_populates="appointments")
+    doctor = relationship("Doctor", back_populates="appointments")
+    slot = relationship("AvailabilitySlot", back_populates="appointment")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Tighten in production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Prometheus metrics endpoint
-metrics_app = make_asgi_app()
-app.mount("/metrics", metrics_app)
-
-# Routers
-app.include_router(voice_router, prefix="/api")
-app.include_router(campaigns_router, prefix="/api")
-app.include_router(metrics_router, prefix="/api")
+    __table_args__ = (
+        Index("ix_appointments_patient", "patient_id", "status"),
+        Index("ix_appointments_doctor_date", "doctor_id", "status"),
+    )
 
 
-@app.get("/health")
-async def health():
-    return {"status": "ok", "service": "VoiceRx"}
+# ── Session Summaries ──────────────────────────────────────────────────────
+
+class SessionSummary(Base):
+    __tablename__ = "session_summaries"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    patient_id = Column(UUID(as_uuid=True), ForeignKey("patients.id", ondelete="CASCADE"), nullable=False)
+    call_sid = Column(String(200), unique=True)
+    language_used = Column(Enum(Language), default=Language.EN)
+    duration_seconds = Column(Integer, nullable=True)
+    turn_count = Column(Integer, default=0)
+    summary_text = Column(Text)          # LLM-generated summary for future context
+    outcome = Column(String(50))          # booked | cancelled | rescheduled | inquiry | no_action
+    appointment_id = Column(UUID(as_uuid=True), ForeignKey("appointments.id"), nullable=True)
+    entities_extracted = Column(JSON, default=dict)  # doctor prefs, date prefs etc.
+    latency_traces = Column(JSON, default=list)       # array of LatencyTrace dicts
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    patient = relationship("Patient", back_populates="sessions")
+
+    __table_args__ = (
+        Index("ix_sessions_patient", "patient_id", "created_at"),
+    )
 
 
-@app.get("/api/debug/session/{call_sid}")
-async def debug_session(call_sid: str):
-    """Dev-only: inspect a live session."""
-    if os.getenv("APP_ENV") != "development":
-        return {"error": "Not available in production"}
-    state = await _memory_manager.get_session(call_sid)
-    if not state:
-        return {"error": "Session not found"}
-    return {
-        "call_sid": state.call_sid,
-        "language": state.language,
-        "turn_count": state.turn_count,
-        "current_intent": state.current_intent,
-        "pending_confirmation": state.pending_confirmation,
-        "history_turns": len(state.conversation_history),
-        "latency_traces": state.latency_traces[-3:],  # Last 3 turns
-    }
+# ── Campaigns ─────────────────────────────────────────────────────────────
+
+class CampaignJob(Base):
+    __tablename__ = "campaign_jobs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String(200), nullable=False)
+    campaign_type = Column(String(50), nullable=False)  # reminder | follow_up | recall
+    scheduled_at = Column(DateTime(timezone=True), nullable=False)
+    status = Column(Enum(CampaignStatus), default=CampaignStatus.PENDING)
+    target_patient_ids = Column(JSON, default=list)
+    script_template = Column(Text)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    logs = relationship("CampaignLog", back_populates="job", cascade="all, delete-orphan")
+
+
+class CampaignLog(Base):
+    __tablename__ = "campaign_logs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    job_id = Column(UUID(as_uuid=True), ForeignKey("campaign_jobs.id", ondelete="CASCADE"), nullable=False)
+    patient_id = Column(UUID(as_uuid=True), ForeignKey("patients.id"), nullable=False)
+    call_sid = Column(String(200), nullable=True)
+    outcome = Column(Enum(CampaignOutcome), nullable=True)
+    outcome_details = Column(Text, nullable=True)
+    call_duration_seconds = Column(Integer, nullable=True)
+    attempted_at = Column(DateTime(timezone=True), server_default=func.now())
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+    job = relationship("CampaignJob", back_populates="logs")
+    patient = relationship("Patient")

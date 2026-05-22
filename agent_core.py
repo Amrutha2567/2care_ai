@@ -1,466 +1,597 @@
 """
-scheduling_service.py — Appointment lifecycle and conflict management.
+agent_core.py — Claude-powered agent with tool orchestration.
 
-All DB writes acquire row-level locks to prevent double-booking under concurrent calls.
-Tool functions here are called directly by the Claude agent.
+The agent:
+1. Receives enriched context (patient history, session state, transcript)
+2. Reasons over available tools (scheduling, memory)
+3. Streams response tokens for low-latency TTS feeding
+4. Logs full reasoning traces for observability
+
+Tool calls are REAL — no hardcoded responses.
+Reasoning traces are printed to stdout and logged to the session.
 """
 from __future__ import annotations
 
-import random
-import string
-import uuid
-from datetime import datetime, timedelta, timezone
-from typing import Optional
+import json
+import time
+from dataclasses import dataclass, field
+from typing import AsyncIterator, Optional, Callable, Any
 
+import anthropic
 import structlog
-from sqlalchemy import select, and_, func
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from models import (
-    Appointment, AppointmentStatus, AvailabilitySlot, Doctor, Patient
-)
-from memory.memory_manager import MemoryManager
+from memory.memory_manager import MemoryManager, SessionState, PatientContext
+from scheduling.scheduling_service import SchedulingService, ConflictError, NotFoundError
 
 log = structlog.get_logger()
 
+# ── Tool Definitions ───────────────────────────────────────────────────────
 
-def _generate_confirmation_code() -> str:
-    return "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
+TOOLS = [
+    {
+        "name": "check_availability",
+        "description": (
+            "Check available appointment slots for a doctor or specialty. "
+            "Use this when the patient asks about available times, wants to book, "
+            "or needs to reschedule. Always call this before proposing a time to the patient."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "doctor_id": {
+                    "type": "string",
+                    "description": "UUID of the doctor. Use if the patient specified a doctor."
+                },
+                "specialty": {
+                    "type": "string",
+                    "description": "Medical specialty (e.g. 'cardiology', 'dermatology'). Use if patient specifies specialty but not a specific doctor."
+                },
+                "date_str": {
+                    "type": "string",
+                    "description": "Date to check availability for, in YYYY-MM-DD format."
+                },
+                "days_ahead": {
+                    "type": "integer",
+                    "description": "Number of days ahead to search. Default 7.",
+                    "default": 7
+                }
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "book_appointment",
+        "description": (
+            "Book an appointment for the patient. Only call this AFTER the patient has "
+            "explicitly confirmed they want to book the specific slot. "
+            "Always confirm the details verbally before calling this tool."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "slot_id": {
+                    "type": "string",
+                    "description": "UUID of the availability slot to book."
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Patient's stated reason for the visit (optional)."
+                }
+            },
+            "required": ["slot_id"]
+        }
+    },
+    {
+        "name": "reschedule_appointment",
+        "description": (
+            "Reschedule an existing appointment to a new slot. "
+            "First use get_patient_appointments to find the appointment_id, "
+            "then check_availability to find the new slot_id."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "appointment_id": {
+                    "type": "string",
+                    "description": "UUID of the appointment to reschedule."
+                },
+                "new_slot_id": {
+                    "type": "string",
+                    "description": "UUID of the new slot."
+                }
+            },
+            "required": ["appointment_id", "new_slot_id"]
+        }
+    },
+    {
+        "name": "cancel_appointment",
+        "description": (
+            "Cancel an existing appointment. Only call this after the patient "
+            "has explicitly confirmed they want to cancel. "
+            "Offer to reschedule first."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "appointment_id": {
+                    "type": "string",
+                    "description": "UUID of the appointment to cancel."
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Reason for cancellation (optional)."
+                }
+            },
+            "required": ["appointment_id"]
+        }
+    },
+    {
+        "name": "get_patient_appointments",
+        "description": (
+            "Retrieve the patient's upcoming and/or past appointments. "
+            "Use this when the patient asks about their bookings or when you need "
+            "an appointment_id to reschedule or cancel."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "include_past": {
+                    "type": "boolean",
+                    "description": "Whether to include past appointments. Default false.",
+                    "default": False
+                }
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "find_alternatives",
+        "description": (
+            "Find alternative appointment slots when the patient's preferred slot or time is unavailable. "
+            "Use this after a conflict is detected or when the patient says a proposed time doesn't work."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "doctor_id": {
+                    "type": "string",
+                    "description": "Doctor UUID if patient wants same doctor."
+                },
+                "specialty": {
+                    "type": "string",
+                    "description": "Specialty if patient is flexible on doctor."
+                },
+                "preferred_date_str": {
+                    "type": "string",
+                    "description": "Starting date to search from, YYYY-MM-DD."
+                },
+                "count": {
+                    "type": "integer",
+                    "description": "Number of alternatives to return. Default 3.",
+                    "default": 3
+                }
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "update_language_preference",
+        "description": (
+            "Update the patient's preferred language. Call this if the patient "
+            "switches language mid-call and confirms they prefer that language."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "language": {
+                    "type": "string",
+                    "enum": ["en", "hi", "ta"],
+                    "description": "Language code: en (English), hi (Hindi), ta (Tamil)."
+                }
+            },
+            "required": ["language"]
+        }
+    }
+]
 
 
-class ConflictError(Exception):
-    """Raised when a requested slot is not available."""
-    pass
+# ── System Prompt ──────────────────────────────────────────────────────────
+
+def build_system_prompt(
+    patient_context: Optional[PatientContext],
+    language: str,
+    is_outbound: bool = False,
+    campaign_script: Optional[str] = None,
+) -> str:
+    lang_instructions = {
+        "en": "Respond in English. Be warm, professional, and concise.",
+        "hi": (
+            "Respond in Hindi. Use simple, conversational Hindi. "
+            "Avoid overly formal language. Medical terms may remain in English "
+            "if no clear Hindi equivalent exists (e.g., 'appointment', 'doctor'). "
+            "Use आप (formal you) when addressing the patient."
+        ),
+        "ta": (
+            "Respond in Tamil. Use polite second-person forms (நீங்கள்). "
+            "Medical terms in English are acceptable. Be warm and respectful."
+        ),
+    }
+
+    patient_section = ""
+    if patient_context:
+        patient_section = f"""
+## Patient Information
+{patient_context.to_prompt_fragment()}
+"""
+
+    outbound_section = ""
+    if is_outbound and campaign_script:
+        outbound_section = f"""
+## Outbound Call Context
+This is an OUTBOUND call initiated by the clinic. You are calling the patient, not receiving their call.
+Start with the campaign script below, then handle their response naturally.
+
+Campaign Script:
+{campaign_script}
+"""
+
+    return f"""You are VoiceRx, a clinical appointment assistant for a healthcare platform.
+You handle appointment booking, rescheduling, cancellation, and general queries through voice.
+
+## Language
+{lang_instructions.get(language, lang_instructions["en"])}
+{patient_section}{outbound_section}
+## Behaviour Guidelines
+
+**Confirmation pattern:** Always verbally confirm details before executing any write operation (book/cancel/reschedule). Say what you're about to do and ask the patient to confirm with "yes" or "haan" or "aamaam" etc.
+
+**Conflict handling:** If a slot is unavailable, immediately offer alternatives. Never leave the patient without options.
+
+**Brevity:** Voice responses should be 1-3 sentences maximum. Do not list more than 3 options at once. Avoid filler phrases.
+
+**Clarity on codes:** When giving confirmation codes, read each character clearly: "Your confirmation code is Alpha-Foxtrot-Seven-Two" or in Hindi spell it out in Hindi.
+
+**Uncertainty:** If you don't understand something, ask one specific clarifying question. Do not guess.
+
+**Closing:** After completing an action, ask if there's anything else. If not, close warmly in 1 sentence.
+
+**Do not:**
+- Invent slot times not returned by tools
+- Book without explicit patient confirmation
+- Disclose other patients' information
+- Provide medical advice or diagnoses
+
+## Tool Usage
+Use tools in this order for booking:
+1. check_availability → present 2-3 options → patient confirms → book_appointment
+2. For rescheduling: get_patient_appointments → check_availability → reschedule_appointment
+3. For cancellation: get_patient_appointments → confirm with patient → cancel_appointment
+
+Always call tools with real parameters. Never fabricate tool results.
+"""
 
 
-class NotFoundError(Exception):
-    pass
+# ── Latency Trace ─────────────────────────────────────────────────────────
+
+@dataclass
+class LatencyTrace:
+    call_sid: str
+    turn: int
+    stt_end_ms: float = 0
+    lang_detect_ms: float = 0
+    redis_read_ms: float = 0
+    first_llm_token_ms: float = 0
+    sentence_boundary_ms: float = 0
+    tts_first_chunk_ms: float = 0
+    total_ms: float = 0
+    timestamps: dict = field(default_factory=dict)
+
+    def record(self, stage: str):
+        self.timestamps[stage] = time.perf_counter() * 1000
+
+    def compute_total(self, start_ms: float):
+        now = time.perf_counter() * 1000
+        self.total_ms = now - start_ms
+        return self
 
 
-class SchedulingService:
+# ── Agent ─────────────────────────────────────────────────────────────────
+
+class VoiceAgent:
     """
-    Stateless service layer. All methods are async and accept a DB session.
-    Returns plain dicts suitable for direct JSON serialisation and LLM injection.
+    Orchestrates the LLM + tool calls for a single conversation turn.
+    Streams response text for low-latency TTS feeding.
     """
 
-    def __init__(self, memory: MemoryManager):
-        self.memory = memory
-
-    # ── Availability ───────────────────────────────────────────────────────
-
-    async def check_availability(
+    def __init__(
         self,
-        db: AsyncSession,
-        doctor_id: Optional[str] = None,
-        specialty: Optional[str] = None,
-        date_str: Optional[str] = None,        # "YYYY-MM-DD"
-        days_ahead: int = 7,
-    ) -> dict:
+        anthropic_client: anthropic.AsyncAnthropic,
+        scheduling_service: SchedulingService,
+        memory_manager: MemoryManager,
+        db_session_factory: Callable,
+        model: str = "claude-sonnet-4-20250514",
+    ):
+        self.client = anthropic_client
+        self.scheduling = scheduling_service
+        self.memory = memory_manager
+        self.db_factory = db_session_factory
+        self.model = model
+
+    async def process_turn(
+        self,
+        transcript: str,
+        session: SessionState,
+        patient_context: Optional[PatientContext],
+        on_token: Callable[[str], None],
+        trace: Optional[LatencyTrace] = None,
+    ) -> str:
         """
-        Find available slots. Returns grouped slots by doctor.
-        Uses Redis cache (60s TTL) to reduce DB load.
+        Process a single conversation turn.
+
+        Args:
+            transcript: The patient's spoken input (transcribed).
+            session: Current session state from Redis.
+            patient_context: Patient history from PostgreSQL.
+            on_token: Callback called with each streamed text token.
+            trace: Latency trace object to populate.
+
+        Returns:
+            The complete assistant response text.
         """
-        # Parse date
-        if date_str:
-            try:
-                target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-            except ValueError:
-                target_date = datetime.now(timezone.utc).date()
-        else:
-            target_date = datetime.now(timezone.utc).date()
+        if trace:
+            trace.record("agent_start")
 
-        start_dt = datetime.combine(target_date, datetime.min.time()).replace(tzinfo=timezone.utc)
-        end_dt = start_dt + timedelta(days=days_ahead)
+        # Add user turn to history
+        session.add_turn("user", transcript)
 
-        # Try cache if specific doctor+date
-        if doctor_id and date_str:
-            cached = await self.memory.get_cached_availability(doctor_id, date_str)
-            if cached is not None:
-                log.debug("availability.cache_hit", doctor_id=doctor_id, date=date_str)
-                return {"slots": cached, "cached": True}
+        # Build messages
+        messages = session.to_claude_messages()
 
-        # Build query
-        q = (
-            select(AvailabilitySlot, Doctor)
-            .join(Doctor, AvailabilitySlot.doctor_id == Doctor.id)
-            .where(
-                and_(
-                    AvailabilitySlot.is_booked == False,
-                    AvailabilitySlot.is_blocked == False,
-                    AvailabilitySlot.start_time >= start_dt,
-                    AvailabilitySlot.start_time < end_dt,
-                    AvailabilitySlot.start_time > func.now(),  # No past slots
-                    Doctor.is_active == True,
-                )
-            )
-            .order_by(AvailabilitySlot.start_time)
-            .limit(50)
+        # Build system prompt
+        system = build_system_prompt(
+            patient_context=patient_context,
+            language=session.language,
+            is_outbound=session.is_outbound,
         )
 
-        if doctor_id:
-            q = q.where(AvailabilitySlot.doctor_id == uuid.UUID(doctor_id))
-        if specialty:
-            q = q.where(Doctor.specialty.ilike(f"%{specialty}%"))
+        full_response = ""
+        tool_calls_this_turn = []
 
-        result = await db.execute(q)
-        rows = result.all()
+        # Agentic loop — keeps calling tools until a final text response
+        iteration = 0
+        max_iterations = 5  # Safety bound
 
-        slots = []
-        for slot, doctor in rows:
-            slots.append({
-                "slot_id": str(slot.id),
-                "doctor_id": str(doctor.id),
-                "doctor_name": doctor.name,
-                "specialty": doctor.specialty,
-                "start_time": slot.start_time.isoformat(),
-                "end_time": slot.end_time.isoformat(),
-                "date": slot.start_time.strftime("%A, %d %B %Y"),
-                "time": slot.start_time.strftime("%I:%M %p"),
-                "duration_minutes": doctor.consultation_duration_minutes,
+        while iteration < max_iterations:
+            iteration += 1
+            first_token = True
+
+            log.info(
+                "agent.llm_call",
+                call_sid=session.call_sid,
+                turn=session.turn_count,
+                iteration=iteration,
+                message_count=len(messages),
+            )
+
+            async with self.client.messages.stream(
+                model=self.model,
+                max_tokens=512,
+                system=system,
+                messages=messages,
+                tools=TOOLS,
+            ) as stream:
+                current_tool_use = None
+                current_tool_input_json = ""
+                response_text = ""
+                stop_reason = None
+
+                async for event in stream:
+                    event_type = type(event).__name__
+
+                    # Track first token latency
+                    if first_token and hasattr(event, "type"):
+                        if event.type in ("content_block_start", "content_block_delta"):
+                            first_token = False
+                            if trace:
+                                trace.record("first_llm_token")
+
+                    # Stream text tokens immediately to TTS
+                    if hasattr(event, "type") and event.type == "content_block_delta":
+                        delta = event.delta
+                        if hasattr(delta, "type"):
+                            if delta.type == "text_delta":
+                                token = delta.text
+                                response_text += token
+                                on_token(token)
+                            elif delta.type == "input_json_delta":
+                                current_tool_input_json += delta.partial_json
+
+                    # Detect tool use block start
+                    if hasattr(event, "type") and event.type == "content_block_start":
+                        block = event.content_block
+                        if hasattr(block, "type") and block.type == "tool_use":
+                            current_tool_use = {
+                                "id": block.id,
+                                "name": block.name,
+                            }
+                            current_tool_input_json = ""
+
+                    # Tool use block complete
+                    if hasattr(event, "type") and event.type == "content_block_stop":
+                        if current_tool_use and current_tool_input_json:
+                            try:
+                                tool_input = json.loads(current_tool_input_json)
+                            except json.JSONDecodeError:
+                                tool_input = {}
+                            current_tool_use["input"] = tool_input
+                            tool_calls_this_turn.append(current_tool_use.copy())
+                            current_tool_use = None
+                            current_tool_input_json = ""
+
+                    # Capture stop reason
+                    if hasattr(event, "type") and event.type == "message_delta":
+                        if hasattr(event.delta, "stop_reason"):
+                            stop_reason = event.delta.stop_reason
+
+            # Log reasoning trace
+            if tool_calls_this_turn:
+                for tc in tool_calls_this_turn:
+                    log.info(
+                        "agent.tool_call",
+                        call_sid=session.call_sid,
+                        tool=tc["name"],
+                        input=tc.get("input", {}),
+                    )
+
+            # If no tool calls, we have a final text response
+            if not tool_calls_this_turn or stop_reason == "end_turn":
+                full_response = response_text
+                session.add_turn("assistant", full_response)
+                break
+
+            # Execute tool calls and append results
+            tool_results = []
+            for tool_call in tool_calls_this_turn:
+                result = await self._execute_tool(
+                    tool_name=tool_call["name"],
+                    tool_input=tool_call.get("input", {}),
+                    session=session,
+                )
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_call["id"],
+                    "content": json.dumps(result),
+                })
+                log.info(
+                    "agent.tool_result",
+                    call_sid=session.call_sid,
+                    tool=tool_call["name"],
+                    result_keys=list(result.keys()) if isinstance(result, dict) else "n/a",
+                )
+
+            # Append assistant turn with tool calls + tool results for next iteration
+            messages.append({
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": response_text} if response_text else None,
+                    *[
+                        {
+                            "type": "tool_use",
+                            "id": tc["id"],
+                            "name": tc["name"],
+                            "input": tc.get("input", {}),
+                        }
+                        for tc in tool_calls_this_turn
+                    ]
+                ],
             })
+            messages[-1]["content"] = [c for c in messages[-1]["content"] if c]
 
-        # Cache if specific doctor+date
-        if doctor_id and date_str:
-            await self.memory.cache_availability(doctor_id, date_str, slots)
+            messages.append({"role": "user", "content": tool_results})
+            tool_calls_this_turn = []
 
-        return {"slots": slots, "total": len(slots)}
+        if trace:
+            trace.record("agent_end")
 
-    # ── Booking ────────────────────────────────────────────────────────────
+        return full_response
 
-    async def book_appointment(
-        self,
-        db: AsyncSession,
-        patient_id: str,
-        slot_id: str,
-        reason: Optional[str] = None,
-        session_id: Optional[str] = None,
+    async def _execute_tool(
+        self, tool_name: str, tool_input: dict, session: SessionState
     ) -> dict:
+        """Dispatch tool calls to the scheduling service."""
+        patient_id = session.patient_id
+
+        async with self.db_factory() as db:
+            try:
+                if tool_name == "check_availability":
+                    return await self.scheduling.check_availability(db=db, **tool_input)
+
+                elif tool_name == "book_appointment":
+                    if not patient_id:
+                        return {"error": "Patient not identified. Cannot book appointment."}
+                    return await self.scheduling.book_appointment(
+                        db=db,
+                        patient_id=patient_id,
+                        session_id=session.call_sid,
+                        **tool_input,
+                    )
+
+                elif tool_name == "reschedule_appointment":
+                    if not patient_id:
+                        return {"error": "Patient not identified."}
+                    return await self.scheduling.reschedule_appointment(
+                        db=db,
+                        patient_id=patient_id,
+                        **tool_input,
+                    )
+
+                elif tool_name == "cancel_appointment":
+                    if not patient_id:
+                        return {"error": "Patient not identified."}
+                    return await self.scheduling.cancel_appointment(
+                        db=db,
+                        patient_id=patient_id,
+                        **tool_input,
+                    )
+
+                elif tool_name == "get_patient_appointments":
+                    if not patient_id:
+                        return {"error": "Patient not identified."}
+                    return await self.scheduling.get_patient_appointments(
+                        db=db,
+                        patient_id=patient_id,
+                        **tool_input,
+                    )
+
+                elif tool_name == "find_alternatives":
+                    return await self.scheduling.find_alternatives(db=db, **tool_input)
+
+                elif tool_name == "update_language_preference":
+                    lang = tool_input.get("language", session.language)
+                    session.language = lang
+                    session.entities_extracted["language_updated"] = lang
+                    return {"success": True, "language": lang}
+
+                else:
+                    return {"error": f"Unknown tool: {tool_name}"}
+
+            except ConflictError as e:
+                log.warning("tool.conflict", tool=tool_name, error=str(e))
+                return {"error": str(e), "conflict": True}
+
+            except NotFoundError as e:
+                log.warning("tool.not_found", tool=tool_name, error=str(e))
+                return {"error": str(e), "not_found": True}
+
+            except Exception as e:
+                log.error("tool.unexpected_error", tool=tool_name, error=str(e))
+                return {"error": "An unexpected error occurred. Please try again."}
+
+    async def generate_session_summary(self, session: SessionState) -> str:
         """
-        Book an appointment. Uses SELECT FOR UPDATE to prevent double-booking.
-        Raises ConflictError if slot is taken.
+        Generate a concise summary of the session for cross-session memory.
+        Uses a lightweight call (not streaming).
         """
-        # Lock the slot row
-        slot_result = await db.execute(
-            select(AvailabilitySlot)
-            .where(AvailabilitySlot.id == uuid.UUID(slot_id))
-            .with_for_update()
-        )
-        slot = slot_result.scalar_one_or_none()
+        if not session.conversation_history:
+            return "No meaningful conversation recorded."
 
-        if slot is None:
-            raise NotFoundError(f"Slot {slot_id} not found")
-
-        if slot.is_booked or slot.is_blocked:
-            raise ConflictError(
-                f"Slot at {slot.start_time.strftime('%I:%M %p, %d %B')} is no longer available"
-            )
-
-        if slot.start_time <= datetime.now(timezone.utc):
-            raise ConflictError("Cannot book an appointment in the past")
-
-        # Check patient has no overlapping appointment
-        overlap_result = await db.execute(
-            select(Appointment)
-            .join(AvailabilitySlot, Appointment.slot_id == AvailabilitySlot.id)
-            .where(
-                and_(
-                    Appointment.patient_id == uuid.UUID(patient_id),
-                    Appointment.status.in_([
-                        AppointmentStatus.SCHEDULED,
-                        AppointmentStatus.CONFIRMED
-                    ]),
-                    AvailabilitySlot.start_time == slot.start_time,
-                )
-            )
-        )
-        if overlap_result.scalar_one_or_none():
-            raise ConflictError("You already have an appointment at this time")
-
-        # Fetch doctor
-        doctor_result = await db.execute(select(Doctor).where(Doctor.id == slot.doctor_id))
-        doctor = doctor_result.scalar_one()
-
-        # Create appointment
-        confirmation_code = _generate_confirmation_code()
-        appointment = Appointment(
-            patient_id=uuid.UUID(patient_id),
-            doctor_id=slot.doctor_id,
-            slot_id=slot.id,
-            status=AppointmentStatus.SCHEDULED,
-            reason=reason,
-            confirmation_code=confirmation_code,
-            booked_via="voice_agent",
-            session_id=session_id,
-        )
-        slot.is_booked = True
-        db.add(appointment)
-        await db.commit()
-        await db.refresh(appointment)
-
-        # Invalidate caches
-        await self.memory.invalidate_availability_cache(
-            str(slot.doctor_id), slot.start_time.strftime("%Y-%m-%d")
-        )
-        await self.memory.invalidate_patient_cache(patient_id)
-
-        log.info(
-            "appointment.booked",
-            appointment_id=str(appointment.id),
-            patient_id=patient_id,
-            doctor=doctor.name,
-            slot=slot.start_time.isoformat(),
+        history_text = "\n".join(
+            f"{t['role'].upper()}: {t['content']}"
+            for t in session.conversation_history[-10:]
         )
 
-        return {
-            "success": True,
-            "appointment_id": str(appointment.id),
-            "confirmation_code": confirmation_code,
-            "doctor_name": doctor.name,
-            "specialty": doctor.specialty,
-            "datetime": slot.start_time.isoformat(),
-            "date": slot.start_time.strftime("%A, %d %B %Y"),
-            "time": slot.start_time.strftime("%I:%M %p"),
-            "duration_minutes": doctor.consultation_duration_minutes,
-            "message": (
-                f"Appointment confirmed with {doctor.name} on "
-                f"{slot.start_time.strftime('%A, %d %B at %I:%M %p')}. "
-                f"Confirmation code: {confirmation_code}"
-            ),
-        }
-
-    # ── Reschedule ─────────────────────────────────────────────────────────
-
-    async def reschedule_appointment(
-        self,
-        db: AsyncSession,
-        appointment_id: str,
-        new_slot_id: str,
-        patient_id: str,
-    ) -> dict:
-        """
-        Reschedule an existing appointment to a new slot.
-        Frees the old slot and books the new one atomically.
-        """
-        # Fetch and validate current appointment
-        appt_result = await db.execute(
-            select(Appointment)
-            .where(
-                and_(
-                    Appointment.id == uuid.UUID(appointment_id),
-                    Appointment.patient_id == uuid.UUID(patient_id),
-                )
-            )
-            .with_for_update()
-        )
-        appointment = appt_result.scalar_one_or_none()
-        if not appointment:
-            raise NotFoundError("Appointment not found or does not belong to this patient")
-        if appointment.status == AppointmentStatus.CANCELLED:
-            raise ConflictError("Cannot reschedule a cancelled appointment")
-
-        # Lock new slot
-        new_slot_result = await db.execute(
-            select(AvailabilitySlot)
-            .where(AvailabilitySlot.id == uuid.UUID(new_slot_id))
-            .with_for_update()
-        )
-        new_slot = new_slot_result.scalar_one_or_none()
-        if not new_slot:
-            raise NotFoundError("New slot not found")
-        if new_slot.is_booked or new_slot.is_blocked:
-            raise ConflictError("New slot is no longer available")
-        if new_slot.start_time <= datetime.now(timezone.utc):
-            raise ConflictError("Cannot reschedule to a time in the past")
-
-        # Free old slot
-        old_slot_result = await db.execute(
-            select(AvailabilitySlot)
-            .where(AvailabilitySlot.id == appointment.slot_id)
-            .with_for_update()
-        )
-        old_slot = old_slot_result.scalar_one()
-        old_slot.is_booked = False
-
-        # Reassign appointment
-        appointment.slot_id = new_slot.id
-        appointment.doctor_id = new_slot.doctor_id
-        appointment.status = AppointmentStatus.SCHEDULED
-        new_slot.is_booked = True
-
-        await db.commit()
-
-        doctor_result = await db.execute(select(Doctor).where(Doctor.id == new_slot.doctor_id))
-        doctor = doctor_result.scalar_one()
-
-        await self.memory.invalidate_patient_cache(patient_id)
-
-        log.info(
-            "appointment.rescheduled",
-            appointment_id=appointment_id,
-            new_slot=new_slot.start_time.isoformat(),
-        )
-
-        return {
-            "success": True,
-            "appointment_id": appointment_id,
-            "confirmation_code": appointment.confirmation_code,
-            "doctor_name": doctor.name,
-            "new_datetime": new_slot.start_time.isoformat(),
-            "date": new_slot.start_time.strftime("%A, %d %B %Y"),
-            "time": new_slot.start_time.strftime("%I:%M %p"),
-            "message": (
-                f"Your appointment has been rescheduled to "
-                f"{new_slot.start_time.strftime('%A, %d %B at %I:%M %p')} with {doctor.name}. "
-                f"Confirmation code remains: {appointment.confirmation_code}"
-            ),
-        }
-
-    # ── Cancellation ───────────────────────────────────────────────────────
-
-    async def cancel_appointment(
-        self,
-        db: AsyncSession,
-        appointment_id: str,
-        patient_id: str,
-        reason: Optional[str] = None,
-    ) -> dict:
-        """Cancel an appointment and free the slot."""
-        appt_result = await db.execute(
-            select(Appointment)
-            .where(
-                and_(
-                    Appointment.id == uuid.UUID(appointment_id),
-                    Appointment.patient_id == uuid.UUID(patient_id),
-                )
-            )
-            .with_for_update()
-        )
-        appointment = appt_result.scalar_one_or_none()
-        if not appointment:
-            raise NotFoundError("Appointment not found")
-        if appointment.status == AppointmentStatus.CANCELLED:
-            raise ConflictError("Appointment is already cancelled")
-
-        # Free slot
-        slot_result = await db.execute(
-            select(AvailabilitySlot)
-            .where(AvailabilitySlot.id == appointment.slot_id)
-            .with_for_update()
-        )
-        slot = slot_result.scalar_one()
-        slot.is_booked = False
-
-        appointment.status = AppointmentStatus.CANCELLED
-        appointment.cancelled_at = datetime.now(timezone.utc)
-        appointment.cancellation_reason = reason
-
-        await db.commit()
-
-        doctor_result = await db.execute(select(Doctor).where(Doctor.id == appointment.doctor_id))
-        doctor = doctor_result.scalar_one()
-
-        await self.memory.invalidate_patient_cache(patient_id)
-        await self.memory.invalidate_availability_cache(
-            str(appointment.doctor_id), slot.start_time.strftime("%Y-%m-%d")
-        )
-
-        log.info("appointment.cancelled", appointment_id=appointment_id)
-
-        return {
-            "success": True,
-            "appointment_id": appointment_id,
-            "doctor_name": doctor.name,
-            "cancelled_datetime": slot.start_time.isoformat(),
-            "message": (
-                f"Your appointment with {doctor.name} on "
-                f"{slot.start_time.strftime('%A, %d %B at %I:%M %p')} has been cancelled."
-            ),
-        }
-
-    # ── Find Alternatives ─────────────────────────────────────────────────
-
-    async def find_alternatives(
-        self,
-        db: AsyncSession,
-        doctor_id: Optional[str] = None,
-        specialty: Optional[str] = None,
-        preferred_date_str: Optional[str] = None,
-        count: int = 3,
-    ) -> dict:
-        """
-        Suggest alternative slots when the requested one is unavailable.
-        Expands the search window progressively (1 day → 3 days → 7 days).
-        """
-        for days in [1, 3, 7, 14]:
-            result = await self.check_availability(
-                db=db,
-                doctor_id=doctor_id,
-                specialty=specialty,
-                date_str=preferred_date_str,
-                days_ahead=days,
-            )
-            if result["slots"]:
-                alternatives = result["slots"][:count]
-                return {
-                    "alternatives": alternatives,
-                    "search_window_days": days,
-                    "message": (
-                        f"I found {len(alternatives)} available slot(s) within "
-                        f"the next {days} day(s)."
+        message = await self.client.messages.create(
+            model="claude-haiku-4-5-20251001",  # Haiku for cheap summarisation
+            max_tokens=200,
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        f"Summarise this patient call in 2-3 sentences. "
+                        f"Note: language used, what they asked about, and the outcome.\n\n"
+                        f"{history_text}"
                     ),
                 }
-
-        return {
-            "alternatives": [],
-            "message": "No availability found in the next 14 days. Please try a different doctor or specialty.",
-        }
-
-    # ── Patient History ────────────────────────────────────────────────────
-
-    async def get_patient_appointments(
-        self,
-        db: AsyncSession,
-        patient_id: str,
-        include_past: bool = False,
-        limit: int = 10,
-    ) -> dict:
-        """Retrieve a patient's appointment history."""
-        q = (
-            select(Appointment)
-            .where(Appointment.patient_id == uuid.UUID(patient_id))
-            .order_by(Appointment.created_at.desc())
-            .limit(limit)
+            ],
         )
-        if not include_past:
-            q = q.where(
-                Appointment.status.in_([
-                    AppointmentStatus.SCHEDULED,
-                    AppointmentStatus.CONFIRMED
-                ])
-            )
-
-        result = await db.execute(q)
-        appointments = []
-        for appt in result.scalars():
-            slot_r = await db.execute(
-                select(AvailabilitySlot).where(AvailabilitySlot.id == appt.slot_id)
-            )
-            slot = slot_r.scalar_one_or_none()
-            doctor_r = await db.execute(
-                select(Doctor).where(Doctor.id == appt.doctor_id)
-            )
-            doctor = doctor_r.scalar_one_or_none()
-
-            appointments.append({
-                "appointment_id": str(appt.id),
-                "confirmation_code": appt.confirmation_code,
-                "doctor_name": doctor.name if doctor else "Unknown",
-                "specialty": doctor.specialty if doctor else "Unknown",
-                "datetime": slot.start_time.isoformat() if slot else "Unknown",
-                "date": slot.start_time.strftime("%A, %d %B %Y") if slot else "Unknown",
-                "time": slot.start_time.strftime("%I:%M %p") if slot else "Unknown",
-                "status": appt.status.value,
-                "reason": appt.reason,
-            })
-
-        return {"appointments": appointments, "total": len(appointments)}
+        return message.content[0].text if message.content else "Session summary unavailable."

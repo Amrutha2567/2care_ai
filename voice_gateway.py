@@ -1,193 +1,516 @@
 """
-lang_detector.py — Two-stage language detection for Indian multilingual voice.
+voice_gateway.py — FastAPI WebSocket handler for real-time voice pipeline.
 
-Stage 1: Deepgram metadata (primary — already computed during STT, free)
-Stage 2: fasttext lid.176 (fallback — in-process, < 3ms)
+This is the main orchestrator. For each call:
+1. Establishes Deepgram STT stream
+2. Detects language from transcripts
+3. Loads patient context from memory
+4. Runs Claude agent on each turn
+5. Streams TTS audio back to telephony
 
-Handles: English, Hindi (hi), Tamil (ta)
-Also handles: Hinglish and Tanglish (code-switching) by dominant language detection.
+Latency instrumentation at every stage.
 """
 from __future__ import annotations
 
-import re
+import asyncio
+import json
+import os
 import time
-from functools import lru_cache
-from pathlib import Path
+import uuid
 from typing import Optional
 
+import anthropic
 import structlog
+from deepgram import (
+    DeepgramClient, DeepgramClientOptions,
+    LiveTranscriptionEvents, LiveOptions
+)
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Request, Response, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from agent.agent_core import VoiceAgent, LatencyTrace, build_system_prompt
+from audio.lang_detector import detect_language
+from audio.tts_streamer import TTSStreamer, SentenceBufferedTTSPipeline, BargeinDetector
+from memory.memory_manager import MemoryManager, SessionState
+from scheduling.scheduling_service import SchedulingService
+from .dependencies import get_db, get_redis, get_memory_manager, get_scheduling_service, get_agent
 
 log = structlog.get_logger()
-
-SUPPORTED_LANGUAGES = {"en", "hi", "ta"}
-DEFAULT_LANGUAGE = "en"
-
-# fasttext language code remapping
-# Deepgram and fasttext may use different codes
-LANG_REMAP = {
-    "en-IN": "en",
-    "en-US": "en",
-    "en-GB": "en",
-    "hi-IN": "hi",
-    "ta-IN": "ta",
-    "tam": "ta",
-    "hin": "hi",
-    "eng": "en",
-}
-
-# Hindi Unicode range (Devanagari)
-DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
-# Tamil Unicode range
-TAMIL_RE = re.compile(r"[\u0B80-\u0BFF]")
+router = APIRouter(prefix="/voice", tags=["voice"])
 
 
-class LanguageDetector:
+# ── Twilio Inbound Webhook ─────────────────────────────────────────────────
+
+@router.post("/inbound")
+async def handle_inbound_call(request: Request):
     """
-    Lightweight language detector for voice transcripts.
+    Twilio calls this when a patient calls in.
+    Responds with TwiML to connect to our WebSocket media stream.
+    """
+    form_data = await request.form()
+    call_sid = form_data.get("CallSid", str(uuid.uuid4()))
+    caller_number = form_data.get("From", "unknown")
+
+    log.info("inbound_call.received", call_sid=call_sid, caller=caller_number)
+
+    public_url = os.getenv("PUBLIC_BASE_URL", "https://your-domain.ngrok.io")
+    ws_url = public_url.replace("https://", "wss://").replace("http://", "ws://")
+
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Connect>
+        <Stream url="{ws_url}/api/voice/media-stream">
+            <Parameter name="callSid" value="{call_sid}"/>
+            <Parameter name="callerNumber" value="{caller_number}"/>
+        </Stream>
+    </Connect>
+</Response>"""
+
+    return Response(content=twiml, media_type="application/xml")
+
+
+# ── Twilio Media Stream WebSocket ──────────────────────────────────────────
+
+@router.websocket("/media-stream")
+async def media_stream(
+    websocket: WebSocket,
+    memory: MemoryManager = Depends(get_memory_manager),
+    scheduling: SchedulingService = Depends(get_scheduling_service),
+    agent: VoiceAgent = Depends(get_agent),
+):
+    """
+    Twilio Media Streams WebSocket handler.
+    Receives mu-law audio, sends back synthesised speech.
     
-    Priorities:
-    1. Unicode script detection (most reliable for Hindi/Tamil)
-    2. Deepgram-reported language (if confidence >= 0.85)
-    3. fasttext classification (fallback)
-    4. Session preference (if all else fails)
+    Pipeline per turn:
+    STT → language detect → memory read → Claude agent → TTS → audio out
     """
+    await websocket.accept()
+    
+    call_sid = None
+    caller_number = "unknown"
+    session: Optional[SessionState] = None
+    deepgram_connection = None
+    tts_streamer: Optional[TTSStreamer] = None
+    barge_in_detector = BargeinDetector()
+    
+    # Track if we're currently speaking (to handle barge-in)
+    is_agent_speaking = asyncio.Event()
+    barge_in_triggered = asyncio.Event()
+    
+    # Queue for transcript→agent processing
+    transcript_queue: asyncio.Queue[dict] = asyncio.Queue()
+    
+    # Latency tracking
+    call_start_time = time.perf_counter() * 1000
+    current_trace: Optional[LatencyTrace] = None
+    utterance_start_time: Optional[float] = None
 
-    def __init__(self, fasttext_model_path: Optional[str] = None):
-        self._ft_model = None
-        self._ft_model_path = fasttext_model_path
-        self._load_fasttext()
+    async def on_barge_in():
+        """Called when patient speaks while agent is talking."""
+        if is_agent_speaking.is_set():
+            log.info("barge_in.triggered", call_sid=call_sid)
+            barge_in_triggered.set()
+            # Signal TTS pipeline to stop (implementation: close current synthesis)
 
-    def _load_fasttext(self):
-        """Load fasttext model lazily."""
-        if not self._ft_model_path:
-            log.warning("lang_detector.no_fasttext_model", 
-                       msg="Using Unicode heuristics only. Download lid.176.bin for better accuracy.")
+    barge_in_detector.set_barge_in_callback(lambda: asyncio.ensure_future(on_barge_in()))
+
+    async def handle_transcript(transcript_data: dict):
+        """
+        Called when Deepgram returns a final transcript.
+        Runs the full agent pipeline and streams audio back.
+        """
+        nonlocal current_trace, utterance_start_time
+
+        transcript = transcript_data.get("text", "").strip()
+        if not transcript:
             return
-        try:
-            import fasttext
-            self._ft_model = fasttext.load_model(self._ft_model_path)
-            log.info("lang_detector.fasttext_loaded")
-        except Exception as e:
-            log.error("lang_detector.fasttext_load_failed", error=str(e))
 
-    def detect(
-        self,
-        text: str,
-        deepgram_lang: Optional[str] = None,
-        deepgram_confidence: float = 0.0,
-        session_lang: Optional[str] = None,
-    ) -> tuple[str, float]:
-        """
-        Detect language of transcript text.
+        is_agent_speaking.set()
+        barge_in_triggered.clear()
+
+        # Build latency trace
+        trace = LatencyTrace(
+            call_sid=call_sid,
+            turn=session.turn_count if session else 0,
+        )
+        trace.record("utterance_end")
+        current_trace = trace
+
+        stt_end = time.perf_counter() * 1000
+
+        # Language detection
+        lang, lang_conf = detect_language(
+            text=transcript,
+            deepgram_lang=transcript_data.get("detected_language"),
+            deepgram_confidence=transcript_data.get("language_confidence", 0.0),
+            session_lang=session.language if session else None,
+        )
+        trace.record("lang_detect")
+        lang_detect_ms = (time.perf_counter() * 1000) - stt_end
+
+        if session and lang != session.language and lang_conf > 0.85:
+            log.info("language.switched", from_lang=session.language, to_lang=lang)
+            session.language = lang
+            if tts_streamer:
+                tts_streamer.set_language(lang)
+
+        log.info(
+            "turn.processing",
+            call_sid=call_sid,
+            transcript=transcript[:80],
+            language=lang,
+            lang_confidence=f"{lang_conf:.2f}",
+        )
+
+        # Load patient context (uses Redis cache)
+        t_redis = time.perf_counter()
+        patient_context = None
+        if session and session.patient_id:
+            async with get_db() as db:
+                patient_context = await memory.get_patient_context(session.patient_id, db)
+        trace.record("redis_read")
+        redis_read_ms = (time.perf_counter() - t_redis) * 1000
+
+        # TTS pipeline
+        tts_pipeline = SentenceBufferedTTSPipeline(tts_streamer)
+
+        def on_token(token: str):
+            """Called for each LLM token — feeds TTS pipeline."""
+            if barge_in_triggered.is_set():
+                return  # Drop tokens after barge-in
+            tts_pipeline.feed_token(token)
+
+        # Run agent (streaming)
+        agent_task = asyncio.create_task(
+            agent.process_turn(
+                transcript=transcript,
+                session=session,
+                patient_context=patient_context,
+                on_token=on_token,
+                trace=trace,
+            )
+        )
+
+        # Flush TTS pipeline when agent is done
+        async def flush_when_done():
+            await agent_task
+            tts_pipeline.flush()
+
+        flush_task = asyncio.create_task(flush_when_done())
+
+        # Stream audio back to Twilio
+        async for audio_chunk in tts_pipeline.run(trace=trace):
+            if barge_in_triggered.is_set():
+                log.info("barge_in.audio_truncated", call_sid=call_sid)
+                break
+
+            # Encode as base64 for Twilio media stream
+            import base64
+            audio_b64 = base64.b64encode(audio_chunk).decode("utf-8")
+            await websocket.send_json({
+                "event": "media",
+                "streamSid": stream_sid,
+                "media": {"payload": audio_b64},
+            })
+
+        await agent_task  # Ensure agent finished
+        is_agent_speaking.clear()
+
+        # Compute and log latency
+        total_ms = (time.perf_counter() * 1000) - stt_end
+        log.info(
+            "turn.latency",
+            call_sid=call_sid,
+            stt_to_first_audio_ms=f"{total_ms:.0f}",
+            lang_detect_ms=f"{lang_detect_ms:.0f}",
+            redis_read_ms=f"{redis_read_ms:.0f}",
+            target_met=total_ms < 450,
+        )
+
+        # Append trace to session
+        if session:
+            session.latency_traces.append({
+                "turn": session.turn_count,
+                "total_ms": total_ms,
+                "lang_detect_ms": lang_detect_ms,
+                "redis_read_ms": redis_read_ms,
+                "timestamps": trace.timestamps,
+            })
+            await memory.update_session(session)
+
+    # ── Deepgram STT Setup ─────────────────────────────────────────────────
+
+    async def setup_deepgram(dg_client: DeepgramClient):
+        live_options = LiveOptions(
+            model="nova-2",
+            language="multi",        # Multilingual detection
+            smart_format=True,
+            interim_results=True,
+            utterance_end_ms=1000,   # 1s silence = end of utterance
+            vad_events=True,
+            endpointing=300,          # ms
+            encoding="mulaw",
+            sample_rate=8000,         # Twilio sends 8kHz mu-law
+            channels=1,
+        )
+
+        dg_conn = dg_client.listen.asyncwebsocket.v("1")
+
+        async def on_message(self, result, **kwargs):
+            """Handle Deepgram transcript events."""
+            try:
+                sentence = result.channel.alternatives[0].transcript
+                if not sentence or not result.is_final:
+                    return
+
+                detected_lang = getattr(result.channel.alternatives[0], "languages", [None])[0]
+                lang_conf = getattr(result.channel.alternatives[0], "confidence", 0.0)
+
+                await transcript_queue.put({
+                    "text": sentence,
+                    "detected_language": detected_lang,
+                    "language_confidence": lang_conf,
+                    "is_final": result.is_final,
+                    "speech_final": result.speech_final,
+                })
+            except Exception as e:
+                log.error("deepgram.message_error", error=str(e))
+
+        async def on_error(self, error, **kwargs):
+            log.error("deepgram.error", error=str(error))
+
+        dg_conn.on(LiveTranscriptionEvents.Transcript, on_message)
+        dg_conn.on(LiveTranscriptionEvents.Error, on_error)
+
+        await dg_conn.start(live_options)
+        return dg_conn
+
+    # ── Main WebSocket Loop ────────────────────────────────────────────────
+
+    stream_sid = None
+
+    try:
+        dg_api_key = os.getenv("DEEPGRAM_API_KEY")
+        dg_client = DeepgramClient(dg_api_key)
+        deepgram_connection = await setup_deepgram(dg_client)
+
+        # Consumer task — processes transcripts in order
+        async def transcript_consumer():
+            while True:
+                data = await transcript_queue.get()
+                if data is None:
+                    break
+                await handle_transcript(data)
+
+        consumer_task = asyncio.create_task(transcript_consumer())
+
+        while True:
+            try:
+                message = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
+            except asyncio.TimeoutError:
+                log.warning("websocket.timeout", call_sid=call_sid)
+                break
+
+            data = json.loads(message)
+            event = data.get("event")
+
+            if event == "connected":
+                log.info("twilio.connected")
+
+            elif event == "start":
+                stream_sid = data["streamSid"]
+                call_sid = data["start"]["callSid"]
+                caller_number = data["start"]["customParameters"].get("callerNumber", "unknown")
+
+                log.info("call.started", call_sid=call_sid, caller=caller_number)
+
+                # Initialise TTS
+                tts_streamer = TTSStreamer(
+                    api_key=os.getenv("ELEVENLABS_API_KEY"),
+                    language="en",  # Will be updated after first transcript
+                )
+
+                # Create or load session
+                async with get_db() as db:
+                    patient_ctx = await memory.get_patient_by_phone(caller_number, db)
+
+                patient_id = patient_ctx.patient_id if patient_ctx else None
+                preferred_lang = patient_ctx.preferred_language if patient_ctx else "en"
+
+                if tts_streamer:
+                    tts_streamer.set_language(preferred_lang)
+
+                session = await memory.create_session(
+                    call_sid=call_sid,
+                    patient_id=patient_id,
+                    patient_name=patient_ctx.name if patient_ctx else None,
+                    language=preferred_lang,
+                )
+
+                log.info(
+                    "session.initialised",
+                    call_sid=call_sid,
+                    patient_id=patient_id,
+                    language=preferred_lang,
+                )
+
+                # Send greeting
+                greeting_by_lang = {
+                    "en": "Hello! Welcome to the clinic. I'm here to help you with your appointments. How can I help you today?",
+                    "hi": "नमस्ते! क्लिनिक में आपका स्वागत है। मैं आपके अपॉइंटमेंट में मदद करने के लिए यहाँ हूँ। आज आपकी कैसे मदद कर सकता हूँ?",
+                    "ta": "வணக்கம்! கிளினிக்கிற்கு வரவேற்கிறோம். உங்கள் அப்பாயிண்ட்மென்ட்களில் உதவ நான் இங்கே இருக்கிறேன். இன்று நான் உங்களுக்கு எப்படி உதவ முடியும்?",
+                }
+                greeting = greeting_by_lang.get(preferred_lang, greeting_by_lang["en"])
+
+                # Synthesise and send greeting
+                import base64
+                async for chunk in tts_streamer.synthesise_streaming(greeting):
+                    audio_b64 = base64.b64encode(chunk).decode("utf-8")
+                    await websocket.send_json({
+                        "event": "media",
+                        "streamSid": stream_sid,
+                        "media": {"payload": audio_b64},
+                    })
+
+            elif event == "media":
+                # Audio from patient — send to Deepgram + barge-in detector
+                payload = data["media"]["payload"]
+                import base64
+                audio_bytes = base64.b64decode(payload)
+
+                # Barge-in detection (when agent is speaking)
+                if is_agent_speaking.is_set():
+                    barge_in_detector.process_audio_frame(audio_bytes)
+
+                # Forward to Deepgram
+                await deepgram_connection.send(audio_bytes)
+
+            elif event == "stop":
+                log.info("call.ended", call_sid=call_sid)
+                break
+
+    except WebSocketDisconnect:
+        log.info("websocket.disconnected", call_sid=call_sid)
+    except Exception as e:
+        log.error("voice_gateway.error", error=str(e), call_sid=call_sid)
+    finally:
+        # Cleanup
+        transcript_queue.put_nowait(None)
         
-        Returns:
-            (language_code, confidence) where language_code in {"en", "hi", "ta"}
-        """
-        start = time.perf_counter()
-        text = text.strip()
+        if deepgram_connection:
+            try:
+                await deepgram_connection.finish()
+            except Exception:
+                pass
 
-        if not text:
-            return (session_lang or DEFAULT_LANGUAGE, 0.5)
+        # Finalise session and write to PostgreSQL
+        if session:
+            try:
+                summary = await agent.generate_session_summary(session)
+                outcome = session.entities_extracted.get("last_action", "no_action")
+                last_appt_id = session.entities_extracted.get("last_appointment_id")
 
-        # Stage 1: Unicode script detection (most reliable for Hindi/Tamil)
-        unicode_lang = self._detect_by_unicode(text)
-        if unicode_lang:
-            elapsed_ms = (time.perf_counter() - start) * 1000
-            log.debug("lang_detect.unicode", lang=unicode_lang, elapsed_ms=f"{elapsed_ms:.1f}")
-            return (unicode_lang, 0.99)
-
-        # Stage 2: Deepgram metadata
-        if deepgram_lang and deepgram_confidence >= 0.85:
-            normalised = self._normalise_lang_code(deepgram_lang)
-            if normalised in SUPPORTED_LANGUAGES:
-                elapsed_ms = (time.perf_counter() - start) * 1000
-                log.debug("lang_detect.deepgram", lang=normalised, 
-                         confidence=deepgram_confidence, elapsed_ms=f"{elapsed_ms:.1f}")
-                return (normalised, deepgram_confidence)
-
-        # Stage 3: fasttext
-        if self._ft_model:
-            ft_lang, ft_conf = self._detect_by_fasttext(text)
-            if ft_conf >= 0.7 and ft_lang in SUPPORTED_LANGUAGES:
-                elapsed_ms = (time.perf_counter() - start) * 1000
-                log.debug("lang_detect.fasttext", lang=ft_lang, 
-                         confidence=ft_conf, elapsed_ms=f"{elapsed_ms:.1f}")
-                return (ft_lang, ft_conf)
-
-        # Stage 4: Session preference or default
-        lang = session_lang or DEFAULT_LANGUAGE
-        elapsed_ms = (time.perf_counter() - start) * 1000
-        log.debug("lang_detect.fallback", lang=lang, elapsed_ms=f"{elapsed_ms:.1f}")
-        return (lang, 0.5)
-
-    def _detect_by_unicode(self, text: str) -> Optional[str]:
-        """
-        Fast Unicode-based detection.
-        If > 10% of chars are Devanagari → Hindi.
-        If > 10% of chars are Tamil script → Tamil.
-        """
-        if len(text) == 0:
-            return None
-        
-        devanagari_count = len(DEVANAGARI_RE.findall(text))
-        tamil_count = len(TAMIL_RE.findall(text))
-        total = len(text)
-
-        if devanagari_count / total > 0.1:
-            return "hi"
-        if tamil_count / total > 0.1:
-            return "ta"
-        return None
-
-    def _detect_by_fasttext(self, text: str) -> tuple[str, float]:
-        """Run fasttext classification."""
-        try:
-            # fasttext expects single line
-            clean = text.replace("\n", " ").strip()
-            predictions = self._ft_model.predict(clean, k=3)
-            labels, scores = predictions
-            
-            for label, score in zip(labels, scores):
-                lang_code = label.replace("__label__", "")
-                normalised = self._normalise_lang_code(lang_code)
-                if normalised in SUPPORTED_LANGUAGES:
-                    return (normalised, float(score))
-            
-            return (DEFAULT_LANGUAGE, 0.5)
-        except Exception as e:
-            log.warning("lang_detect.fasttext_error", error=str(e))
-            return (DEFAULT_LANGUAGE, 0.5)
-
-    @staticmethod
-    def _normalise_lang_code(code: str) -> str:
-        """Normalise various language code formats to our standard codes."""
-        code = code.lower().strip()
-        return LANG_REMAP.get(code, code[:2])  # Take first 2 chars as fallback
+                async with get_db() as db:
+                    await memory.finalise_session(
+                        state=session,
+                        db=db,
+                        summary_text=summary,
+                        outcome=outcome,
+                        appointment_id=last_appt_id,
+                    )
+                log.info("call.session_finalised", call_sid=call_sid)
+            except Exception as e:
+                log.error("session_finalise.error", error=str(e))
 
 
-# ── Standalone helper ──────────────────────────────────────────────────────
+# ── Direct WebSocket (for testing without Twilio) ─────────────────────────
 
-_detector_singleton: Optional[LanguageDetector] = None
+@router.websocket("/direct-test")
+async def direct_test_ws(
+    websocket: WebSocket,
+    memory: MemoryManager = Depends(get_memory_manager),
+    agent: VoiceAgent = Depends(get_agent),
+):
+    """
+    Simplified WebSocket for local testing — accepts JSON text messages,
+    returns agent text responses without audio processing.
+    
+    Message format: {"text": "Book me an appointment", "phone": "+919876543210"}
+    """
+    await websocket.accept()
+    call_sid = f"test_{uuid.uuid4().hex[:8]}"
+    session = None
 
-def get_detector(fasttext_model_path: Optional[str] = None) -> LanguageDetector:
-    global _detector_singleton
-    if _detector_singleton is None:
-        _detector_singleton = LanguageDetector(fasttext_model_path)
-    return _detector_singleton
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            data = json.loads(raw)
 
+            if data.get("type") == "init":
+                phone = data.get("phone", "+910000000000")
+                async with get_db() as db:
+                    patient_ctx = await memory.get_patient_by_phone(phone, db)
 
-def detect_language(
-    text: str,
-    deepgram_lang: Optional[str] = None,
-    deepgram_confidence: float = 0.0,
-    session_lang: Optional[str] = None,
-    fasttext_model_path: Optional[str] = None,
-) -> tuple[str, float]:
-    """Convenience function for one-off detection."""
-    detector = get_detector(fasttext_model_path)
-    return detector.detect(
-        text=text,
-        deepgram_lang=deepgram_lang,
-        deepgram_confidence=deepgram_confidence,
-        session_lang=session_lang,
-    )
+                session = await memory.create_session(
+                    call_sid=call_sid,
+                    patient_id=patient_ctx.patient_id if patient_ctx else None,
+                    patient_name=patient_ctx.name if patient_ctx else None,
+                    language=patient_ctx.preferred_language if patient_ctx else "en",
+                )
+                await websocket.send_json({
+                    "type": "session_started",
+                    "call_sid": call_sid,
+                    "patient": patient_ctx.name if patient_ctx else "Unknown",
+                    "language": session.language,
+                })
+                continue
+
+            if not session:
+                await websocket.send_json({"error": "Send {type: init, phone: ...} first"})
+                continue
+
+            transcript = data.get("text", "").strip()
+            if not transcript:
+                continue
+
+            lang, _ = detect_language(text=transcript, session_lang=session.language)
+            session.language = lang
+
+            tokens_collected = []
+
+            def collect_token(token: str):
+                tokens_collected.append(token)
+
+            async with get_db() as db:
+                patient_ctx = await memory.get_patient_context(session.patient_id, db) if session.patient_id else None
+
+            full_response = await agent.process_turn(
+                transcript=transcript,
+                session=session,
+                patient_context=patient_ctx,
+                on_token=collect_token,
+            )
+            await memory.update_session(session)
+
+            await websocket.send_json({
+                "type": "response",
+                "text": full_response,
+                "language": session.language,
+                "turn": session.turn_count,
+            })
+
+    except WebSocketDisconnect:
+        pass
+    finally:
+        if session:
+            try:
+                async with get_db() as db:
+                    summary = await agent.generate_session_summary(session)
+                    await memory.finalise_session(
+                        state=session, db=db,
+                        summary_text=summary,
+                        outcome=session.entities_extracted.get("last_action", "no_action"),
+                    )
+            except Exception as e:
+                log.error("test_session_finalise.error", error=str(e))
